@@ -100,6 +100,12 @@ rejected.**
 
 ⚠ **Any pull requests that contain JNI to a library that reads / modifies in-game memory will be rejected.**
 
+⚠ **Any feature that risks triggering an antivirus or Windows SmartScreen flag (e.g. global
+low-level input hooks, raw-input registration, process injection of any kind) will be rejected.**
+There is no code-signing certificate and no budget to buy one — signing is not an available
+mitigation for this risk. A design that is only acceptable *if* the binary gets signed is not
+acceptable; it must be safe to ship unsigned.
+
 NO EXCEPTIONS
 
 The app's architecture is decoupled and modular. This means modules do not have a direct dependency or

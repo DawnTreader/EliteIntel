@@ -7,7 +7,33 @@ installation on a user's machine.
 
 ---
 
-## Key finding that reframes the whole problem
+## SUPERSEDED 2026-06-20 — see correction below
+
+**The "Key finding" section immediately below this note is WRONG and should not be used.** It
+was speculative web research, explicitly caveated by its own author as based on forum
+testimony rather than verification. It has since been directly contradicted by the user's own
+real, verified machine paths. Kept here only as historical record of a dead end — do not design
+against it.
+
+**The actual, confirmed structure:** `DeviceMappings.xml`/`ControlSchemes`/`.buttonMap` files
+live **inside each storefront's own install folder**, under that storefront's own `Products\`
+subfolder — there is no single shared `%LOCALAPPDATA%\Frontier_Developments\Products\...`
+location used by all storefronts. Each storefront's install genuinely has its own separate
+`ControlSchemes` tree under its own `[GameInstall]\Products\<product-name>\` folder (e.g.
+`[Epic install]\Products\elite-dangerous-64\ControlSchemes\DeviceMappings.xml`,
+`[Steam install]\Products\elite-dangerous-odyssey-64\ControlSchemes\DeviceMappings.xml`) — this
+is exactly why BindForge's mandatory fan-out save/backup logic (Section D) was designed the way
+it was: there really are multiple independent copies to keep in sync, not one shared file. See
+`BindForge_Punch_List.md` Section E.1 for the full, corrected per-storefront path table.
+
+The `.binds`/`StartPreset.*.start` files are unaffected by any of this — those really do live
+in one single shared user-config location regardless of storefront
+(`%LOCALAPPDATA%\Frontier Developments\Elite Dangerous\Options\Bindings\`), confirmed
+separately and not in dispute.
+
+---
+
+## Key finding that reframes the whole problem (SUPERSEDED — see note above)
 
 Before going point-by-point: the premise that there are "N installs → N separate
 `ControlSchemes` folders" is **not quite accurate**, and this changes the design significantly.
