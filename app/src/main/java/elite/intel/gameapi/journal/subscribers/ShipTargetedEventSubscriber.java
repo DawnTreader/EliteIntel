@@ -8,7 +8,7 @@ import elite.intel.eventbus.GameEventBus;
 import elite.intel.gameapi.journal.events.ShipTargetedEvent;
 import elite.intel.session.PlayerSession;
 import elite.intel.util.Md5Utils;
-import elite.intel.util.RomanNumeralConverter;
+import elite.intel.util.Ranks;
 import elite.intel.util.TTSFriendlyNumberConverter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -31,10 +31,8 @@ public class ShipTargetedEventSubscriber {
             GameEventBus.publish(new RadarContactAnnouncementEvent(localizedEvent("event.target.contactLost")));
         }
 
-        String localizedShipName = event.getShipLocalised();
-        String ship = localizedShipName == null ? "" : RomanNumeralConverter.convertRomanInName(localizedShipName);
-        String pilotName = event.getPilotNameLocalised();
-        String pilotRank = event.getPilotRank();
+        String pilotRankLocalized = Ranks.getLocalizedPilotFederationRankMap().get(event.getPilotRank());
+
         String legalStatus = event.getLegalStatus() == null ? null : event.getLegalStatus().toLowerCase();
         int bounty = event.getBounty();
         String missionTargetOrNull = isMissionTargetOrNull(event);
@@ -49,18 +47,16 @@ public class ShipTargetedEventSubscriber {
                     : localizedEvent("event.target.legalTarget");
             info.append(localizedEvent("event.target.contact", contactType));
 
-            info.append(pilotRank == null ? localizedEvent("event.target.rankUnknown") : pilotRank.replace("_", " "));
+            info.append(pilotRankLocalized == null ? localizedEvent("event.target.rankUnknown") : pilotRankLocalized);
             info.append(", ");
 
-            info.append(legalStatus == null ? localizedEvent("event.target.legalStatusUnknown") : legalStatus.replace("_", " "));
+            info.append(legalStatus == null ? localizedEvent("event.target.legalStatusUnknown") : Ranks.getLocalizedLegalStatus(event.getLegalStatus()));
             info.append(", ");
 
             info.append(bounty == 0 ? localizedEvent("event.target.noBounty") : localizedEvent("event.target.bounty", TTSFriendlyNumberConverter.formatBountyForSpeech(bounty)));
             info.append(", ");
 
-            if (shieldHealth == 100 && hullHealth == 100) {
-                //info.append("All Systems Normal");
-            } else {
+            if (shieldHealth != 100 || hullHealth != 100) {
                 if (shieldHealth == 0) {
                     info.append(localizedEvent("event.target.shieldsOffline"));
                 } else if (shieldHealth < 50) {
