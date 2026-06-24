@@ -72,6 +72,18 @@ AxisSlot extends BindingSlot
     a plain yes/no question instead of each independently comparing against the raw placeholder
     text. Purely additive — the raw `device`/`key` values are still readable unchanged, needed for
     accurate round-tripping back to the file.
+- **Critical execution-layer caveat, confirmed 2026-06-23 (full detail in Punch List Section A):**
+  `key`/`modifiers` must keep storing the raw XML values exactly as written, unchanged — that's
+  still correct for accurate round-tripping/editing. But Frontier's own capture process does not
+  treat `<Primary>`/`<Modifier>` as semantically meaningful labels — it's confirmed, reproducible
+  behavior that a genuine modifier key (e.g. `LeftControl`) can end up written as the slot's `key`,
+  while a genuine action key (e.g. `Y`) ends up written as a `<Modifier>`. **Any future BindForge
+  code that *executes* a binding (sends real keystrokes) must classify each key by its own
+  identity — `Alt`/`Ctrl`/`Shift` are always held, anything else is always tapped — rather than
+  trusting `BindingSlot.key` to actually be the key to tap or `BindingSlot.modifiers` to actually
+  be the keys to hold.** This is a parsing/execution-layer responsibility layered on top of this
+  model, not something `BindingSlot`'s field meanings should try to encode — the model's job is
+  still just to hold the raw values faithfully.
 - Independently arrived at by EliteChroma's `EliteFiles` library (C#) via its own
   `DeviceKeyBase`/`DeviceKey`/`DeviceKeyCombination` split and `Undefined` sentinel — convergent
   design from a separate team solving the identical modeling problem.

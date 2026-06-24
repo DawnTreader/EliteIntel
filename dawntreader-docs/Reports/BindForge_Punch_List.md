@@ -6,17 +6,13 @@
 
 ## A. Settled — `.binds` Schema (fully evidence-backed)
 
-- Three element types: AXIS (`<Binding>` + optional `Inverted`/`Deadzone`), BUTTON (`<Primary>`/`<Secondary>` + optional element-wide `<ToggleOn>`), STANDALONE SETTING (bare `Value=`, no slots).
-- Slot-level properties apply to any `Primary`/`Secondary`/`Binding` slot:
-  - `Modifier`: zero to **three** per slot (hard cap — 4th overflows into becoming the base key). Any device type (not keyboard-only — confirmed via `AutoBreakBuggyButton`/RVWAP joystick-as-modifier and the Virpil slider end-of-travel button quirk). Left/Right tracked as distinct values, freely mixable. Same key can't be both base and modifier on one slot.
-  - `Hold`: per-slot, boolean-ish (`Value="1"` observed), origin is *how the key was captured* (held ~1+ sec during detection vs. tapped), not a user-chosen setting. Never appears on AXIS. Independent of and can coexist with `ToggleOn` on the same element (confirmed via `ToggleCargoScoop`).
-  - `ToggleOn`: element-level (covers both Primary and Secondary as one shared behavior, not per-slot). Only two observed values (0/1). BUTTON-only, never AXIS.
-  - `Deadzone`: AXIS-only, range 0–1, never on BUTTON.
-  - `Inverted`: AXIS-only.
-- Edge cases confirmed in full-file extraction (`AUDIT_v2_FULL.md`): duplicate element names possible (`MouseGUI` ×2); half-axis/mouse-wheel key strings (`Neg_Joy_YAxis`, `Pos_Mouse_ZAxis`) can appear on BUTTON slots, not just AXIS; named devices beyond RVWAP/Keyboard/Mouse exist (T-Rudder, LVWAP, vJoy) — device field must accept arbitrary names; one non-conforming node (`KeyboardLayout`, text-content not attribute) needs its own handling path; element *names* are not reliable type indicators (`*ButtonPartial` elements classify as AXIS).
-- Source of truth = the `.binds` XML schema itself, not any single file's populated/unpopulated state. Audit files are schema specimens, not personal-config trackers.
-- `.binds` has exactly **one** canonical file location system-wide (`%LOCALAPPDATA%\Frontier Developments\Elite Dangerous\Options\Bindings\`) — shared across all storefront installs, no multiplicity.
-- `DeviceMappings.xml` + `.buttonMap` files are cosmetic-only (button labeling), **not** game config — but are duplicated per-installation (one full copy under each storefront's own `ControlSchemes` folder). Multiplicity confirmed real (Steam + Epic side by side).
+**Moved 2026-06-23 to its own dedicated document:** `BindForge_Binding_Rules_Reference.md` is
+now the single source of truth for everything about how Frontier's `.binds` file format and the
+game's own binding behavior actually work — the three element types, every slot-level property
+and its quirks (including the modifier mislabeling bug and the subset key-set suppression
+bug), file location/lifecycle facts, and where the in-game UI itself is incomplete or wrong.
+This section is kept only as a pointer so nothing gets maintained in two places at once — see
+that document for the actual content.
 
 ## B. Settled — Existing Codebase Assessment
 
@@ -112,64 +108,70 @@
 5. **PARTIALLY RESOLVED — corrected 2026-06-20:** the data model class shapes (`BindingProfile`, the `BindingSlot` hierarchy, the `BindingElement` hierarchy, `DeviceEntry`/`DeviceIdentifier`, the `buttonLabels` map) are drafted in `BindForge_Data_Model.md`. `BindingModifier` confirmed as the existing codebase class (`app/src/main/java/elite/intel/ai/hands/BindingModifier.java`), reused as-is. **Still genuinely open, not implementation detail to defer:** the actual extended-parser/writer method design for AXIS/STANDALONE/DeviceMappings/buttonMap. Previously and wrongly marked as safe to leave to implementation — this is actually something that needs real planning attention before CCTIJ can build it, the same way the data shapes did.
 6. **RESOLVED:** raw XML element name (`BindingElement.name`) is sufficient — no synthetic ID needed. Purpose Mode (a planned UI-only re-grouping of existing binds by purpose — e.g. "Left motion" spanning Ship/SRV/On Foot — built only after Game Mode is working) doesn't change or add to the underlying data, it just groups by name; the existing name already serves as the reference key it needs.
 
-## F. Open — Onboarding: Missing Key Bind Detection & Auto-Fill (new scope, 2026-06-21 Krondor meeting)
+## F. BUILT — Onboarding: Missing Key Bind Detection & Auto-Fill (shipped by Krondor, 2026-06-23, ticket KAN-65)
 
-Krondor wants to scope down the first BindForge publish from everything previously planned in
-this document and focus on two things first: onboarding (this section) and a more game-like
-editing interface (folded into Section E.4's keyboard-capture work above). He liked the broader
-ideas but wants this narrower slice shipped first.
+This section was written as forward planning starting 2026-06-21. **As of 2026-06-23, Krondor
+built and shipped the actual feature on `origin/V1.1` (commits `3034a06a`/`7a1a3f28`, "Add
+one-shot auto-assign for unbound key bindings") before our planning got there.** What follows is
+the real implementation, confirmed by reading the merged code
+(`dawntreader-docs/Reports/2026-06-23_autofill_sync_report.md` has the full audit) — superseding
+the speculative items below it. Kept for the historical record of what was planned versus what
+shipped, since they differ in a few real ways.
 
-1. **What "missing" actually means, clarified 2026-06-21:** this is not about every possible
-   game action being unassigned — it's specifically about **EliteIntel's own command-dispatch
-   reliability**. EliteIntel sends voice-triggered commands to the game by simulating the
-   keypresses for whatever `.binds` entry that action maps to. If that entry's slot is
-   `{NoDevice}` (unassigned), the keypress simulation has nothing to send, and that voice command
-   silently fails in-game. So "missing" = `{NoDevice}`/empty slots specifically among the subset
-   of `.binds` elements EliteIntel's own command set depends on — not a general audit of every
-   action in the schema.
-   - **Krondor's direct instruction, 2026-06-21: this detection may already exist.** He's pointed
-     CCTIJ at two specific methods to examine in `elite.intel.ai.hands` —
-     `findMissingGameBindings()` and `checkForMissingBindingsAndPersist()` — as the basis for
-     building the missing-bindings list, rather than designing detection from scratch. **Open
-     verification item, not yet confirmed:** whether these methods exist verbatim today (in which
-     case this feature is substantially building on existing logic) or are intended names for
-     something still to be built. This needs checking before scoping the work, since it changes
-     how much of this is "wire up existing detection" versus "build detection from zero."
-2. **Two fill paths, both wanted, presented as an explicit user choice — refined 2026-06-21:**
-   the flow is detect → notify the user they have missing key bindings → show a choice dialog
-   ("Auto-fill these for me" vs. "Let me assign each one myself") → carry out whichever the user
-   picked → confirmation dialog before anything is actually applied → persist through the
-   existing working-copy/apply pipeline (Section B). This is a real UI screen, not just two
-   buttons living side by side — the user picks a path up front, then that path runs to
-   completion (either the full auto-fill set goes to confirmation together, or the user is walked
-   through manually assigning each missing entry one at a time via the same capture mechanism as
-   general editing, Section E.4).
-   - **Automatic path** — generate values via the algorithm in item 3 below.
-   - **User-chosen path** — let the user manually assign each one themselves.
-3. **Auto-fill key/modifier selection — now fully specified by Krondor, 2026-06-21, not just a
-   general principle:** generate combination bindings using `LeftCtrl`/`LeftShift`/`RightShift`/
-   `LeftAlt` as modifiers plus a base key drawn **only** from the set of letters that sit in the
-   same physical position with the same printed label across QWERTY, QWERTZ, and AZERTY layouts:
-   `E R T U I O P S D F G H J K L B N`. Explicitly avoid `Q W A Z Y M` (these shift position or
-   meaning between layouts) and all punctuation keys (layout-dependent, error-prone). This
-   directly satisfies the earlier "don't steal desirable keys" principle with a concrete,
-   international-layout-safe pool rather than leaving it as a vague preference.
-4. **Backup-before-apply and restore-from-backup are required**, but the *existing* backup
-   mechanism is flagged as needing reassessment first — see the new Section D bullet above and
-   the CCTIJ research prompt for this section. (Confirmed 2026-06-21 by the actual backup audit:
-   the active Apply-time backup mechanism is sound in isolation, but has no first-run snapshot, no
-   multi-file coverage, no retention limit, and **no restore UI exists at all today** — "Revert"
-   only discards the in-app draft, it does not restore from a backup file. All of this still needs
-   building, not just reassessing.)
-5. **UI implementation, per Krondor's instruction 2026-06-21:** follow the existing
-   `elite.intel.ui.screen` package's UI controls/theme conventions exactly, and use the existing
-   localization (i18n properties) system for any new UI text — no new UI paradigm for this
-   feature, just the missing-bindings notification, the auto-fill-vs-manual choice dialog, a
-   "generate missing bindings" button on the BindForge tab, and the confirmation dialog before
-   applying. Separately, the longer-term goal of the editing UI feeling more like the game's own
-   control-binding interface (Section E.4's "click a slot, press the key you want" capture
-   pattern) still stands as the broader direction once SDL3 keyboard capture is live — this item
-   is about the *onboarding* UI specifically, not a contradiction of that broader goal.
+1. **Detection — confirmed built on existing methods, exactly as Krondor said it would be.**
+   `findMissingGameBindings()`/`checkForMissingBindingsAndPersist()` in `BindingsMonitor` were
+   real and already shipped (confirmed 2026-06-23, `dawntreader-docs/Reports/2026-06-23_Missing_Bindings_Audit.md`)
+   — but the new auto-assign feature **does not use them**. It introduces its own, broader
+   definition instead — see item 2.
+2. **Two notions of "missing" now coexist, by design — this differs from the original framing
+   above.** The new `MissingBindingAutoAssigner.isKeyboardBound(...)` is the single shared
+   predicate behind both the Used/Missing tab split *and* the auto-assigner: a control counts as
+   bound if either its Primary or Secondary slot is keyboard-usable, checked against **every
+   keyboard-capable control in the file** — not just the ones EliteIntel itself depends on for
+   command dispatch. Rationale (confirmed in the shipped UI wiring): custom commands can target
+   any control, not just EliteIntel's built-in ~80. The original, narrower
+   `Bindings.GameCommand`-scoped definition (Section F's original premise) still exists,
+   unchanged, but now only drives the voice/log announcements and the AI tab's badge count
+   (`BindingsSummaryChangedEvent`) — it no longer drives the bindings tab's own tables.
+3. **Fill paths — built differently than planned, same net effect.** No upfront "auto-fill vs.
+   manual" choice dialog exists. Instead: a footer **"Fix Missing"** button (enabled only when
+   the Missing tab is non-empty) batch-fixes everything after a confirmation dialog, and a new
+   per-row auto-fix column fixes one control at a time. Manual assignment remains available
+   separately through the existing editor (dropdown-based today, per Section E.4's still-pending
+   SDL3-capture work) — so a user effectively still has both paths, just as two independent
+   actions rather than a single branching dialog.
+   - **Add, never replace, enforced in code:** an edit is only produced for an empty
+     (`{NoDevice}`) slot — controller/HOTAS and existing keyboard assignments are never touched.
+   - **Never collide, enforced in code:** a chord (key + optional modifier) is checked against
+     every chord already in the file and against everything already planned in the same batch
+     before being used.
+   - Skips are categorized and reported: `BOTH_SLOTS_OCCUPIED`, `NO_EDITABLE_SLOT`,
+     `NO_FREE_KEY` — surfaced to the user in a summary dialog after applying, broken down by
+     reason.
+4. **Auto-fill key/modifier pool — broader than what was speculated below.** `SafeKeyboardKeys`
+   includes the cross-layout-safe letters as planned (`E R T U I O P S D F G H J K L B N`,
+   excluding `Q W A Z M Y`), **plus digits `0`–`9`, the full numpad, and `F1`–`F12`** — none of
+   which were in the original speculative list. Safe modifiers are `LeftControl`/`LeftShift`/
+   `LeftAlt`/`RightShift` (matches what was planned), explicitly excluding `RightAlt` since it's
+   AltGr on AZERTY/QWERTZ (a detail the original planning didn't call out). Allocation order:
+   every base key × every safe modifier first, then plain unmodified keys — confirms the
+   "don't steal desirable bare keys" principle, now enforced in code via `orderedChords()`.
+5. **Runs off the EDT, as the original UI-implementation item anticipated would be needed.**
+   `applyPlanInBackground` runs each edit on a dedicated thread (re-reading/rewriting the file
+   per edit via the existing `BindingsWriter`), marshalling the result and table refresh back
+   onto the EDT — so a large batch doesn't freeze the UI.
+6. **Backup-before-apply: unchanged from the existing pipeline, not specially extended for this
+   feature.** Each edit goes through the same `BindingsWriter.assignKeyboardKey(...)` path
+   already audited in `dawntreader-docs/Reports/2026-06-21_Backup_System_Audit.md` — meaning the
+   gaps identified there (no first-run snapshot, no multi-file coverage, no retention limit, no
+   restore UI) are **still open and unaddressed by this feature**, not resolved by it. Auto-fill
+   makes those gaps more pressing, not less, since it's the feature most likely to produce a
+   large batch of edits a user might want to undo at once.
+7. **UI implementation followed existing conventions, as instructed** — built directly into
+   `BindForgeTabPanel` using the existing table/dialog/i18n patterns, no new UI paradigm. The
+   longer-term goal of the editing UI feeling more like the game's own control-binding interface
+   (Section E.4's SDL3 "click a slot, press the key you want" capture pattern) is unaffected by
+   this — auto-fill and live capture are separate, complementary features.
 6. **Architectural constraint:** singletons, not DI (see new Section B bullet) — applies to any
    new detection/fill-logic service built for this.
 
