@@ -175,6 +175,59 @@ shipped, since they differ in a few real ways.
 6. **Architectural constraint:** singletons, not DI (see new Section B bullet) — applies to any
    new detection/fill-logic service built for this.
 
+## G. Settled — Backup & Restore (new "Binding Management" tab, designed 2026-06-23)
+
+Genuinely new scope, distinct from Section F — this is a real, missing gap confirmed by the
+2026-06-21 backup audit (no first-run snapshot, no multi-file coverage, no retention limit, and
+**no restore UI exists at all today**). Krondor isn't building this; it's ours.
+
+- **UI structure:** split the current single "Binding Profile" screen into two tabs — "Binding
+  Profile" (today's existing view, unchanged) and a new "Binding Management" tab for everything
+  below.
+- **Scope of what gets backed up:** every `.binds` file in the user's bindings folder (not just
+  the currently-active preset) plus `StartPreset.4.start`. `DeviceMappings.xml`/`.buttonMap` are
+  explicitly **deferred** until BindForge does input capture and backups for those file types —
+  not part of this feature's scope yet.
+- **Location:** a new, dedicated folder — `%LOCALAPPDATA%\elite-intel\playerbackups\` on
+  Windows — separate from the existing internal `elite-intel/bindings/backups/` mechanism (see
+  below). On Linux/macOS, resolved the same way `AppPaths.getAppDataBase()` already resolves
+  EliteIntel's own data folder (`XDG_DATA_HOME`, falling back to `~/.local/share`), so
+  `playerbackups` sits as a sibling under that same base rather than introducing a new
+  resolution scheme. Deliberately named generically (not `bindingsbackups`) so future features
+  (commander profiles, etc.) can add their own subfolders alongside it later.
+- **Relationship to the existing automatic per-Apply backup — kept separate, not merged.** The
+  existing `BindingsApplyService`/`BindingsBackupService` mechanism (one timestamped `.bak` file
+  per Apply, written to `elite-intel/bindings/backups/`) serves a different purpose — an
+  internal safety net tied to the apply-pipeline's own conflict-detection logic — and stays
+  exactly as it is. `playerbackups` is a separate, additional, user-facing feature on top, not a
+  replacement or redirection of that existing path.
+- **Identity:** one flat list of backups for now (no grouping by preset) — acknowledged this
+  will likely need revisiting as the feature expands, but flat is the right starting point.
+- **Physical layout: one timestamped folder per backup event** (e.g.
+  `playerbackups\2026-06-23_14-30-00\`), containing the original files with their real
+  filenames intact — not zipped. A "backup" is one folder; restoring means restoring that whole
+  folder's contents as a unit. Zip bundling was considered and explicitly deferred — there's a
+  real future need for it once `DeviceMappings`/`.buttonMap` (or other file types) make
+  "many small files per snapshot" a bigger concern, but that's expected to land much later
+  (tentatively EliteIntel v2+), not part of this design.
+- **Trigger:** a manual "Backup Now" action, on demand — not just the existing automatic
+  per-Apply trigger. Creates a new timestamped folder snapshot of the current live `.binds`
+  files + `StartPreset.4.start`.
+- **Restore — two targets, both sharing the same first step:**
+  1. Loading a selected backup's files into the working copy (`elite-intel/bindings/`) as the
+     new draft — this is the shared mechanism behind both restore options.
+  2. **Restore to editing slot** stops there — the user can review/further-edit the restored
+     content before deciding whether to Apply, same as importing any other draft.
+  3. **Restore to live** continues immediately into the existing, already-safe `Apply` pipeline
+     (`BindingsApplyService.apply()`) — meaning a restore-to-live still gets the existing
+     conflict-check and the existing pipeline's own pre-write backup of whatever's currently
+     live, rather than a separate, less-safe direct-write path. Confirmed by the user 2026-06-23:
+     restore-to-live should go through the safe apply pipeline, not bypass it.
+- **Architectural constraint:** singletons, not DI (same as Section B/F) — applies to any new
+  backup/restore service built for this.
+- **Still open, not yet designed:** the actual UI layout of the new tab (table columns, button
+  placement), and the concrete Java class/method shapes for the new backup/restore service.
+
 ---
 
 *Last updated from planning session — fold in future findings as they're settled.*

@@ -140,6 +140,16 @@ key by its own identity, independent of which XML element it's nested in: `Alt`/
 (any left/right variant) are always held; anything else is always tapped, regardless of XML
 position.
 
+**Confirmed implemented in EliteIntel itself, 2026-06-24.** `KeyBindingExecutor.normalizeChord()`
+pools every key from both slots into a set, classifies each by identity
+(`isModifierKey()` — is this specific token one of the six supported Ctrl/Shift/Alt variants,
+regardless of which XML element it came from), holds the modifiers, and taps the single
+remaining non-modifier key. Two edge cases are explicitly logged rather than silently
+mis-executed: every key in the chord turning out to be a modifier (nothing to tap), and two or
+more non-modifier keys in one chord (ambiguous — the slot-labelled primary is preferred if it
+qualifies). Any future BindForge execution code can reuse this exact pattern rather than
+re-deriving it.
+
 ### `Hold` — per-slot, capture-method artifact
 
 ```xml
@@ -156,51 +166,38 @@ position.
 - **UI display inconsistency, confirmed 2026-06-23:** `Hold` does not appear in the game's
   right-hand "About this setting" explanation panel, but it does show directly in the bind
   slot's own display. The two panels can show inconsistent information for the same binding.
-- **A separate, more important and more precisely-diagnosed pitfall lives under §2.5 below
-  (subset key-set suppression) — it is the real explanation for cases that initially looked
-  like a `Hold`-specific collision, but turned out to be a more general mechanism unrelated to
-  `Hold` at all.**
+- **A theory once suspected here — that one binding's key set being a subset of another's
+  causes silent suppression — was investigated further and retracted. See §2.5.**
 
-### 2.5 The subset key-set suppression bug — the most important pitfall in this document
+### 2.5 The subset-suppression theory — investigated, retracted, 2026-06-24
 
-Confirmed by live reproduction, 2026-06-23: two structurally identical 3-modifier chords, one
-worked and one silently failed, with no error shown anywhere, and the failure reproduced both
-through the app and by editing the bindings manually in-game (ruling out timing or capture
-method as the cause):
+An earlier round of testing (2026-06-23) reproduced a case that looked exactly like
+subset-key-set suppression: `LeftCtrl+LeftShift+LeftAlt+I` (assigned to `GalaxyMapOpen`) fired
+correctly, while the structurally identical `LeftCtrl+LeftShift+LeftAlt+Y` (also assigned to
+`GalaxyMapOpen`, with `Y` alone separately bound to `HeadLookReset`) silently failed to fire.
+The working theory at the time was that Elite matches a binding whenever *all* its keys are
+held (not requiring "and nothing else"), making `{Y}` a subset of `{Ctrl,Shift,Alt,Y}`, and
+that the engine statically suppresses the more specific (longer) binding whenever this overlap
+exists anywhere in the same context.
 
-- `LeftCtrl + LeftShift + LeftAlt + I` → assigned to `GalaxyMapOpen` → **worked correctly.**
-- `LeftCtrl + LeftShift + LeftAlt + Y` → also assigned to `GalaxyMapOpen` → **silently failed
-  to fire.**
+**Retracted.** Further in-game testing did not reproduce this as a real conflict — the original
+failure was traced to a **stale `.binds` reload**: Elite had not yet re-read the file (see the
+lifecycle note below), so the test was observing an old binding state, not a genuine
+subset-suppression rule. The actual, now-confirmed matching model is the opposite of the
+retracted theory:
 
-**Root cause, deduced from the failure pattern: Elite matches a binding whenever *all* of its
-required keys are currently held — it does not require that nothing else also be held.** In
-this case, `Y` by itself was separately bound to `HeadLookReset` (a bare single-key binding,
-no modifiers). A bare binding like that matches *any* held-key state that includes `Y` —
-including the held state `{Ctrl, Shift, Alt, Y}` produced while trying to fire the
-`GalaxyMapOpen` chord. That makes `{Y}` a **strict subset** of `{Ctrl, Shift, Alt, Y}`.
+> **Elite matches a binding by its exact chord — the main key plus exactly its modifier set.
+> Holding extra modifiers does not trigger a binding that has fewer of them.** A bare key
+> (e.g. `HeadLookReset = Key_Y`) and a modified chord on that same key (e.g.
+> `Ctrl+Shift+Alt+Y`) are two distinct chords that **both fire correctly, independently** — they
+> do not conflict, and neither suppresses the other. Two bindings only conflict when they share
+> the **identical** key set, within the same active context.
 
-**When one binding's required key set is a strict subset of another's, within the same control
-context, Elite detects the overlap and suppresses the more specific (longer) binding — not the
-shorter one.** This is the opposite of what most people would assume ("the more specific combo
-should take priority") — instead, Elite statically disables the longer/more-specific binding
-the moment it detects that a shorter binding elsewhere could also be satisfied by the same
-held-key state.
-
-This explains why the `I`-based chord worked: nothing else in the file uses a bare `Key_I`
-alone, so its chord has no subset partner and stands alone. The `Y`-based chord failed purely
-because `HeadLookReset = Key_Y` existed elsewhere in the same context.
-
-**Confirmed as a static, file-wide condition — not timing-dependent, not capture-method-
-dependent.** It's inherent to having both bindings exist simultaneously in the same context,
-regardless of how either one was assigned (the app vs. editing the file by hand both reproduce
-the identical failure).
-
-**Practical implication for any future auto-assign/capture key-pool logic:** before assigning
-a modifier-combo chord using base key `K`, check whether `K` (or any other existing binding's
-full key set) is a strict subset of the chord being assigned, anywhere in the same control
-context. If so, the new, more specific binding will be **silently suppressed by the game
-itself**, with no error or warning surfaced to the user anywhere — they will simply observe
-that the new binding "doesn't work," with no indication why.
+**New, genuinely useful lifecycle pitfall this surfaced:** Elite only re-reads its `.binds`
+file when its own in-game Controls screen is opened — editing the file externally (by hand or
+via any tool) does not take effect immediately in a running game session. Any testing
+methodology, including this kind of root-cause investigation, must account for this or it will
+misattribute a stale-read symptom to a real binding-logic bug, exactly as happened here.
 
 ### `ToggleOn` — element-level, BUTTON-only
 
@@ -303,23 +300,27 @@ inventory of what's bindable. Anything built against "what the game shows you" r
 2. The modifier cap (3) is enforced by **press order**, not key identity — and Frontier's own
    capture process can and does mislabel a real action key as a `<Modifier>` and a real
    modifier key as the `Key=` attribute. Anything that executes a binding by trusting those
-   labels at face value will get hold/tap roles backwards.
-3. **The most consequential pitfall: any binding whose key set is a strict subset of another
-   binding's key set, in the same control context, causes Elite to silently suppress the more
-   specific (longer) one — with zero error or warning shown anywhere.** A bare single-key
-   binding anywhere in a context can silently break any modifier-combo chord built on top of
-   that same key, elsewhere in the same context. Confirmed static and capture-method-
-   independent, not a timing issue.
-4. `Hold` can show inconsistently between the game's two display surfaces (the explanation
+   labels at face value will get hold/tap roles backwards. (EliteIntel's own execution layer now
+   correctly normalizes by key identity instead — see §2.)
+3. **Elite only re-reads `.binds` when its own in-game Controls screen is opened.** Editing the
+   file externally takes no effect in a running game session until that screen is opened —
+   skipping this step makes a real edit look like a no-op, or makes a stale read look like a
+   genuine bug (this is exactly what produced the now-retracted subset-suppression theory in
+   §2.5 — test methodology must account for it).
+4. Elite's actual binding-match model is **exact-chord, not subset/priority-based**: a bare key
+   and a modified chord on that same key are distinct and both fire independently, never
+   suppressing each other. (A subset-suppression theory was suspected here and retracted after
+   further testing — see §2.5.)
+5. `Hold` can show inconsistently between the game's two display surfaces (the explanation
    panel vs. the slot display itself).
-5. The in-game Control Bindings UI is not a complete or fully accurate inventory of the
+6. The in-game Control Bindings UI is not a complete or fully accurate inventory of the
    `.binds` schema — real, bindable elements exist that the UI never shows, and some UI rows
    don't correspond to any real XML element at all.
-6. Controller/joystick device identity in the file is an opaque, undecodable hex string — no
+7. Controller/joystick device identity in the file is an opaque, undecodable hex string — no
    VID/PID/device-type distinction survives into the format.
-7. `DeviceMappings.xml`/`.buttonMap` genuinely duplicate per storefront install; `.binds` does
+8. `DeviceMappings.xml`/`.buttonMap` genuinely duplicate per storefront install; `.binds` does
    not — these two file families have different multiplicity rules, easy to get wrong.
-8. Game updates can silently wipe the cosmetic files and occasionally the bindings themselves,
+9. Game updates can silently wipe the cosmetic files and occasionally the bindings themselves,
    with no guaranteed pattern to when this happens.
 
 ---

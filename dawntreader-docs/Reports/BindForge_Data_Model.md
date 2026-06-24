@@ -84,6 +84,10 @@ AxisSlot extends BindingSlot
   be the keys to hold.** This is a parsing/execution-layer responsibility layered on top of this
   model, not something `BindingSlot`'s field meanings should try to encode — the model's job is
   still just to hold the raw values faithfully.
+  - **Confirmed implemented, 2026-06-24:** `KeyBindingExecutor.normalizeChord()` in the existing
+    codebase already does exactly this normalization (pools all keys, classifies by identity,
+    holds modifiers, taps the one remaining trigger). Any future BindForge execution code should
+    reuse this pattern rather than re-deriving it.
 - Independently arrived at by EliteChroma's `EliteFiles` library (C#) via its own
   `DeviceKeyBase`/`DeviceKey`/`DeviceKeyCombination` split and `Undefined` sentinel — convergent
   design from a separate team solving the identical modeling problem.
