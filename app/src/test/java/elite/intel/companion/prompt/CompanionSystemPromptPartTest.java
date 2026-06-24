@@ -34,6 +34,17 @@ class CompanionSystemPromptPartTest {
     }
 
     @Test
+    void carriesGroundingNoFitAndPoliteClosingRules() {
+        String text = prompt.staticRules(ThoughtSource.COMMANDER);
+        // Grounding: do not invent facts.
+        assertTrue(text.contains("never invent or guess facts"));
+        // No-fit: clarify or decline instead of forcing (or pretending to perform) an unrelated function.
+        assertTrue(text.contains("clarify"));
+        // Polite closing: do not promise to check and then go silent.
+        assertTrue(text.contains("fall silent"));
+    }
+
+    @Test
     void commanderBranchAllowsActionsAndExcludesEventRule() {
         String text = prompt.staticRules(ThoughtSource.COMMANDER);
         assertTrue(text.contains("## Turn source"));

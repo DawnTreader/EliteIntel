@@ -14,9 +14,11 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * System function: search the action catalog for a ship/game action matching a description. COMMANDER-only.
+ * Legacy system function: search the action catalog for a ship/game action matching a description.
+ * Retired and no longer registered ({@code @RegisterSystemFunction} removed) because a small local model
+ * does not reliably reach for it and the reducer surfaces the right tools well enough on its own; the class
+ * is kept as reference in case a system-side catalog fallback revives it. COMMANDER-only.
  */
-@RegisterSystemFunction
 public final class FindActionFunction implements SystemFunction {
 
     public static final String ID = "find_action";
@@ -29,8 +31,8 @@ public final class FindActionFunction implements SystemFunction {
     }
 
     @Override
-    public String descriptionKey() {
-        return ID;
+    public String llmDescription() {
+        return "Search the full catalog for a ship action or information query matching a description. Use this when what the commander wants, an action or a piece of information, is not among the functions offered this turn (only a relevant subset is offered each turn).";
     }
 
     @Override

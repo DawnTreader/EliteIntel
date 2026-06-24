@@ -48,6 +48,15 @@ class MidTermTopicMemory {
         return matched;
     }
 
+    /** Every entry across all topics; the gateway's unified search does the query matching. */
+    List<MemoryEntry> allEntries() {
+        List<MemoryEntry> all = new ArrayList<>();
+        for (List<MemoryEntry> entries : byTopic.values()) {
+            all.addAll(entries);
+        }
+        return all;
+    }
+
     /** Topics that currently hold entries (for the prompt topic-memory index). */
     List<ConversationTopic> topicsWithMemory() {
         List<ConversationTopic> topics = new ArrayList<>();
