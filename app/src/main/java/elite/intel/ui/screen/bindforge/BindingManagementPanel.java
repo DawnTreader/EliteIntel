@@ -31,6 +31,8 @@ public class BindingManagementPanel extends JPanel {
     private final PlayerBackupService backupService = PlayerBackupService.getInstance();
 
     private DefaultTableModel tableModel;
+    private JButton backupNowButton;
+    private boolean backupInProgress;
 
     public BindingManagementPanel() {
         buildUi();
@@ -57,7 +59,7 @@ public class BindingManagementPanel extends JPanel {
     }
 
     private JPanel buildFooter() {
-        JButton backupNowButton = makeButton(getText("bindForge.bindingManagement.button.backupNow"));
+        backupNowButton = makeButton(getText("bindForge.bindingManagement.button.backupNow"));
         backupNowButton.addActionListener(e -> performBackup());
         return HudFooter.build(false, null, null, List.of(backupNowButton));
     }
@@ -66,17 +68,46 @@ public class BindingManagementPanel extends JPanel {
         refreshBackups();
     }
 
+    /**
+     * Runs the backup sweep off the EDT, same as {@code BindingProfilePanel}'s
+     * {@code applyPlanInBackground()} - a multi-file copy would otherwise freeze the UI.
+     */
     private void performBackup() {
-        try {
-            backupService.createBackup();
-            refreshBackups();
-        } catch (IOException e) {
-            JOptionPane.showMessageDialog(
-                    this,
-                    getText("bindForge.bindingManagement.backup.error", e.getMessage()),
-                    getText("bindForge.bindingManagement.backup.dialogTitle"),
-                    JOptionPane.ERROR_MESSAGE);
+        if (backupInProgress) {
+            return;
         }
+        setBackupBusy(true);
+        new Thread(() -> {
+            IOException failure = null;
+            try {
+                backupService.createBackup();
+            } catch (IOException e) {
+                failure = e;
+            }
+            IOException result = failure;
+            SwingUtilities.invokeLater(() -> {
+                setBackupBusy(false);
+                if (result != null) {
+                    showBackupError(result);
+                } else {
+                    refreshBackups();
+                }
+            });
+        }, "PlayerBackup-Thread").start();
+    }
+
+    private void setBackupBusy(boolean busy) {
+        backupInProgress = busy;
+        setCursor(busy ? Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR) : Cursor.getDefaultCursor());
+        backupNowButton.setEnabled(!busy);
+    }
+
+    private void showBackupError(IOException e) {
+        JOptionPane.showMessageDialog(
+                this,
+                getText("bindForge.bindingManagement.backup.error", e.getMessage()),
+                getText("bindForge.bindingManagement.backup.dialogTitle"),
+                JOptionPane.ERROR_MESSAGE);
     }
 
     private void refreshBackups() {
