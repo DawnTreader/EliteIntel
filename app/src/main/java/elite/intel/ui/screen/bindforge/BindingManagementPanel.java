@@ -6,6 +6,8 @@ import elite.intel.ui.widget.HudFooter;
 import elite.intel.ui.widget.HudPanel;
 import elite.intel.ui.widget.HudSection;
 import elite.intel.ui.widget.HudTable;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -23,6 +25,8 @@ import static elite.intel.ui.theme.HudPalette.*;
  * separate, future piece of work, so this panel has no restore actions yet.
  */
 public class BindingManagementPanel extends JPanel {
+
+    private static final Logger log = LogManager.getLogger(BindingManagementPanel.class);
 
     private final PlayerBackupService backupService = PlayerBackupService.getInstance();
 
@@ -85,7 +89,8 @@ public class BindingManagementPanel extends JPanel {
                 });
             }
         } catch (IOException e) {
-            // Could not list playerbackups (e.g. permissions) - leave the table empty.
+            // Leave the table empty; the user can still retry via Backup Now.
+            log.warn("Could not list player backups: {}", e.getMessage());
         }
     }
 

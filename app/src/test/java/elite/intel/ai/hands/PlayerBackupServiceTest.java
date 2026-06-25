@@ -3,6 +3,7 @@ package elite.intel.ai.hands;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,6 +13,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PlayerBackupServiceTest {
@@ -73,6 +75,24 @@ class PlayerBackupServiceTest {
         assertEquals("2026-06-24_19-00-00", backups.get(0).timestamp());
         assertEquals("2026-06-24_18-00-00", backups.get(1).timestamp());
         assertEquals(List.of("Custom.3.0.binds"), backups.get(0).fileNames());
+    }
+
+    @Test
+    void createBackupThrowsWhenBindingsDirHasNothingToBackUp() throws Exception {
+        Path bindingsDir = tempDir.resolve("bindings");
+        Files.createDirectories(bindingsDir);
+        write(bindingsDir.resolve("DeviceMappings.xml"), "<ignored/>"); // out of scope, doesn't count
+
+        PlayerBackupService service = service(tempDir.resolve("playerbackups"), fixedClock("2026-06-24T18:30:00Z"));
+
+        assertThrows(IOException.class, () -> service.createBackup(bindingsDir));
+    }
+
+    @Test
+    void listBackupsReturnsEmptyListWhenNoBackupsExistYet() throws Exception {
+        PlayerBackupService service = service(tempDir.resolve("playerbackups"), fixedClock("2026-06-24T18:30:00Z"));
+
+        assertTrue(service.listBackups().isEmpty());
     }
 
     private PlayerBackupService service(Path playerBackupsDir, Clock clock) {
