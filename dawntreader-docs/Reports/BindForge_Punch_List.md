@@ -175,11 +175,27 @@ shipped, since they differ in a few real ways.
 6. **Architectural constraint:** singletons, not DI (see new Section B bullet) — applies to any
    new detection/fill-logic service built for this.
 
-## G. Settled — Backup & Restore (new "Binding Management" tab, designed 2026-06-23)
+## G. Backup & Restore (new "Binding Management" tab, designed 2026-06-23)
 
 Genuinely new scope, distinct from Section F — this is a real, missing gap confirmed by the
 2026-06-21 backup audit (no first-run snapshot, no multi-file coverage, no retention limit, and
 **no restore UI exists at all today**). Krondor isn't building this; it's ours.
+
+**Build status, 2026-06-24:**
+- ✅ **BUILT** — tab split (`57dcab6a`): BIND FORGE now has "Binding Profile" / "Binding
+  Management" sub-tabs, `BindingProfilePanel` extracted unchanged, `AppView` needed zero
+  changes.
+- ✅ **BUILT** — backup creation & listing (`ef12e9bb`): `PlayerBackupService` (singleton, not
+  DI) sweeps every `.binds` file + `StartPreset.*.start` into a new timestamped folder under
+  `playerbackups` (collision-safe `-1`/`-2` suffix on same-second backups), confirmed
+  `DeviceMappings.xml` correctly excluded. `AppPaths.getPlayerBackupsDir()` resolves
+  `playerbackups` as a sibling to `bindings/`/`db/`/`custom-commands/` via the same
+  XDG/LOCALAPPDATA-aware base path, confirmed isolated from the existing per-Apply
+  `BindingsBackupService` mechanism. "Binding Management" now has a working "Backup Now" button
+  and a flat, newest-first backup list (Created/Files columns). 3 new unit tests, all green.
+- ⬜ **Not yet built** — restore (both targets: editing-slot, and live via the existing safe-apply
+  pipeline). Separate, future task — everything below this status block remains the settled
+  design for it.
 
 - **UI structure:** split the current single "Binding Profile" screen into two tabs — "Binding
   Profile" (today's existing view, unchanged) and a new "Binding Management" tab for everything
