@@ -1,11 +1,14 @@
 package elite.intel.ai.hands;
 
+import elite.intel.eventbus.UiBus;
 import elite.intel.session.PlayerSession;
+import elite.intel.ui.event.BindingsUpdatedEvent;
 import elite.intel.util.AppPaths;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -17,13 +20,17 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Creates and lists on-demand, user-facing snapshots of every {@code .binds} file in the
- * bindings directory plus {@code StartPreset.*.start}, written to {@code playerbackups}
+ * Creates, lists, and restores on-demand, user-facing snapshots of every {@code .binds} file in
+ * the bindings directory plus {@code StartPreset.*.start}, written to {@code playerbackups}
  * (see {@link AppPaths#getPlayerBackupsDir()}). Deliberately separate from the internal,
  * per-Apply {@link BindingsBackupService}/{@link BindingsApplyService} mechanism, which is an
  * apply-pipeline safety net rather than a user-triggered feature.
  * <p>
- * Backup creation/listing only - restoring a backup is a separate, future piece of work.
+ * Restore has two targets sharing the same first step (loading the backup's file for the active
+ * preset into the working copy as the new draft): {@link #restoreToWorkingCopy} stops there;
+ * {@link #restoreToLive} continues into the existing safe-apply pipeline so a live restore still
+ * gets that pipeline's own conflict-check and pre-write backup, rather than a separate,
+ * less-safe direct write to the game directory.
  */
 public class PlayerBackupService {
 
@@ -34,16 +41,27 @@ public class PlayerBackupService {
     private static volatile PlayerBackupService instance;
 
     private final BindingsLoader bindingsLoader;
+    private final BindingsWorkingCopyRepository workingCopyRepo;
+    private final BindingsApplyService applyService;
     private final Clock clock;
     /** Overrides {@link AppPaths#getPlayerBackupsDir()} in tests; {@code null} in production. */
     private final Path baseDirOverride;
 
     private PlayerBackupService() {
-        this(new BindingsLoader(), Clock.systemDefaultZone(), null);
+        this(new BindingsLoader(), new BindingsWorkingCopyRepository(), new BindingsApplyService(),
+                Clock.systemDefaultZone(), null);
     }
 
-    PlayerBackupService(BindingsLoader bindingsLoader, Clock clock, Path baseDirOverride) {
+    PlayerBackupService(
+            BindingsLoader bindingsLoader,
+            BindingsWorkingCopyRepository workingCopyRepo,
+            BindingsApplyService applyService,
+            Clock clock,
+            Path baseDirOverride
+    ) {
         this.bindingsLoader = bindingsLoader;
+        this.workingCopyRepo = workingCopyRepo;
+        this.applyService = applyService;
         this.clock = clock;
         this.baseDirOverride = baseDirOverride;
     }
@@ -98,6 +116,37 @@ public class PlayerBackupService {
                     .sorted(Comparator.comparing(PlayerBackup::timestamp).reversed())
                     .toList();
         }
+    }
+
+    /**
+     * Loads {@code presetFileName} from {@code backupFolder} into the current working copy,
+     * making it the new draft - the same starting point as any other edit-in-progress.
+     * Publishes {@link BindingsUpdatedEvent} so the Binding Profile tab reloads and reflects it.
+     *
+     * @throws IOException if the backup has no file for that preset, or the write fails
+     */
+    public void restoreToWorkingCopy(Path backupFolder, String presetFileName) throws IOException {
+        Path backupFile = backupFolder.resolve(presetFileName);
+        if (!Files.exists(backupFile)) {
+            throw new IOException("Backup " + backupFolder.getFileName() + " has no file named " + presetFileName);
+        }
+        String content = Files.readString(backupFile, StandardCharsets.UTF_8);
+        workingCopyRepo.save(presetFileName, content);
+        log.info("Restored '{}' from backup {} into the working copy", presetFileName, backupFolder.getFileName());
+        UiBus.publish(new BindingsUpdatedEvent());
+    }
+
+    /**
+     * Same first step as {@link #restoreToWorkingCopy}, then immediately applies the restored
+     * draft to the game directory via the existing safe-apply pipeline - the same
+     * conflict-check and pre-write backup any other Apply gets.
+     *
+     * @return the path of the apply pipeline's own pre-write backup, or {@code null} if the game file did not exist
+     */
+    public Path restoreToLive(Path backupFolder, String presetFileName, Path gameBindsFile)
+            throws IOException, BindingsApplyException {
+        restoreToWorkingCopy(backupFolder, presetFileName);
+        return applyService.apply(presetFileName, gameBindsFile);
     }
 
     private PlayerBackup toPlayerBackup(Path folder) {

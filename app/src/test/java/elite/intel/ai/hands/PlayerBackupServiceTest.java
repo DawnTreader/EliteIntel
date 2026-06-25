@@ -13,6 +13,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -95,8 +96,72 @@ class PlayerBackupServiceTest {
         assertTrue(service.listBackups().isEmpty());
     }
 
+    @Test
+    void restoreToWorkingCopyLoadsTheBackupFileAsTheNewDraft() throws Exception {
+        Path bindingsDir = tempDir.resolve("bindings");
+        Files.createDirectories(bindingsDir);
+        String originalContent = binds("A");
+        write(bindingsDir.resolve("Custom.3.0.binds"), originalContent);
+
+        BindingsWorkingCopyRepository workingCopyRepo = workingCopyRepo();
+        PlayerBackupService service = service(tempDir.resolve("playerbackups"), fixedClock("2026-06-24T18:30:00Z"), workingCopyRepo);
+        Path backupFolder = service.createBackup(bindingsDir);
+
+        service.restoreToWorkingCopy(backupFolder, "Custom.3.0.binds");
+
+        Path workingCopy = workingCopyRepo.getWorkingCopyPath("Custom.3.0.binds");
+        assertEquals(originalContent, Files.readString(workingCopy, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void restoreToWorkingCopyThrowsWhenBackupHasNoFileForThatPreset() throws Exception {
+        Path bindingsDir = tempDir.resolve("bindings");
+        Files.createDirectories(bindingsDir);
+        write(bindingsDir.resolve("Custom.3.0.binds"), binds("A"));
+
+        PlayerBackupService service = service(tempDir.resolve("playerbackups"), fixedClock("2026-06-24T18:30:00Z"));
+        Path backupFolder = service.createBackup(bindingsDir);
+
+        assertThrows(IOException.class, () -> service.restoreToWorkingCopy(backupFolder, "DawnTreader.4.0.binds"));
+    }
+
+    @Test
+    void restoreToLiveAppliesTheRestoredDraftThroughTheSafeApplyPipeline() throws Exception {
+        Path bindingsDir = tempDir.resolve("bindings");
+        Files.createDirectories(bindingsDir);
+        String originalContent = binds("A");
+        write(bindingsDir.resolve("Custom.3.0.binds"), originalContent);
+
+        BindingsWorkingCopyRepository workingCopyRepo = workingCopyRepo();
+        PlayerBackupService service = service(tempDir.resolve("playerbackups"), fixedClock("2026-06-24T18:30:00Z"), workingCopyRepo);
+        Path backupFolder = service.createBackup(bindingsDir);
+
+        Path gameFile = bindingsDir.resolve("Custom.3.0.binds");
+        write(gameFile, binds("Z")); // live file has since diverged from the backup
+
+        Path applyBackup = service.restoreToLive(backupFolder, "Custom.3.0.binds", gameFile);
+
+        assertNotNull(applyBackup);
+        assertEquals(originalContent, Files.readString(gameFile, StandardCharsets.UTF_8));
+        assertEquals(binds("Z"), Files.readString(applyBackup, StandardCharsets.UTF_8));
+    }
+
     private PlayerBackupService service(Path playerBackupsDir, Clock clock) {
-        return new PlayerBackupService(new BindingsLoader(), clock, playerBackupsDir);
+        return service(playerBackupsDir, clock, workingCopyRepo());
+    }
+
+    private PlayerBackupService service(Path playerBackupsDir, Clock clock, BindingsWorkingCopyRepository workingCopyRepo) {
+        BindingsApplyService applyService =
+                new BindingsApplyService(workingCopyRepo, new BindingsBackupService(), tempDir.resolve("applybackups"));
+        return new PlayerBackupService(new BindingsLoader(), workingCopyRepo, applyService, clock, playerBackupsDir);
+    }
+
+    private BindingsWorkingCopyRepository workingCopyRepo() {
+        return new BindingsWorkingCopyRepository(tempDir.resolve("working"));
+    }
+
+    private String binds(String key) {
+        return "<Root Key=\"" + key + "\"/>";
     }
 
     private Clock fixedClock(String instant) {
