@@ -193,9 +193,26 @@ Genuinely new scope, distinct from Section F — this is a real, missing gap con
   XDG/LOCALAPPDATA-aware base path, confirmed isolated from the existing per-Apply
   `BindingsBackupService` mechanism. "Binding Management" now has a working "Backup Now" button
   and a flat, newest-first backup list (Created/Files columns). 3 new unit tests, all green.
-- ⬜ **Not yet built** — restore (both targets: editing-slot, and live via the existing safe-apply
-  pipeline). Separate, future task — everything below this status block remains the settled
-  design for it.
+- ✅ **BUILT** — restore, both targets (`11086754`): `PlayerBackupService.restoreToWorkingCopy()`
+  / `.restoreToLive()`. "Restore to Editing Slot" writes the backup's file into the working copy
+  via `BindingsWorkingCopyRepository.save()` and publishes `BindingsUpdatedEvent`, which
+  `BindingProfilePanel` already reacts to — no new coupling needed. "Restore to Live" does the
+  same first step, then calls the exact same `BindingsApplyService.apply()` method/parameters as
+  a normal Apply, so it gets the identical conflict-check and pre-write backup. Both run off the
+  EDT; both confirm before acting, naming the specific file. A duplicated success/error-dialog
+  pattern found by code-integrity review was extracted into a shared
+  `BindingApplyResultPresenter`, now used by both `BindingProfilePanel` and this restore path. 3
+  new unit tests (8/8 total in `PlayerBackupServiceTest`, all green).
+  - **Real scope narrowing, confirmed during implementation — corrects the "whole folder as a
+    unit" phrasing below:** `StartPreset.*.start` has no "working copy"/draft concept anywhere
+    in the existing codebase — only `.binds` files do. Restoring it would require writing
+    directly to the live bindings directory, exactly the less-safe direct-write path this
+    design explicitly ruled out. **Restore therefore only covers the `.binds` file for
+    whichever preset is currently active** (resolved via the new
+    `BindingsMonitor.resolveActiveBindsFile()`) — not `StartPreset.*.start`, and not other
+    presets' `.binds` files that might also be sitting in the same backup folder. If the
+    selected backup has no file for the active preset, both restore methods fail with a clear
+    error rather than silently restoring nothing or guessing a different preset.
 
 - **UI structure:** split the current single "Binding Profile" screen into two tabs — "Binding
   Profile" (today's existing view, unchanged) and a new "Binding Management" tab for everything
@@ -229,9 +246,12 @@ Genuinely new scope, distinct from Section F — this is a real, missing gap con
 - **Trigger:** a manual "Backup Now" action, on demand — not just the existing automatic
   per-Apply trigger. Creates a new timestamped folder snapshot of the current live `.binds`
   files + `StartPreset.4.start`.
-- **Restore — two targets, both sharing the same first step:**
-  1. Loading a selected backup's files into the working copy (`elite-intel/bindings/`) as the
-     new draft — this is the shared mechanism behind both restore options.
+- **Restore — two targets, both sharing the same first step. As shipped, this restores the
+  `.binds` file for the active preset only, not the whole backup folder as a unit — see the
+  "real scope narrowing" note above for why.**
+  1. Loading the selected backup's `.binds` file (for the currently-active preset) into the
+     working copy (`elite-intel/bindings/`) as the new draft — this is the shared mechanism
+     behind both restore options.
   2. **Restore to editing slot** stops there — the user can review/further-edit the restored
      content before deciding whether to Apply, same as importing any other draft.
   3. **Restore to live** continues immediately into the existing, already-safe `Apply` pipeline
