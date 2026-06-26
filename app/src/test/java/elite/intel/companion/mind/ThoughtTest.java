@@ -10,7 +10,6 @@ import elite.intel.companion.memory.MemoryGateway;
 import elite.intel.companion.model.ConversationTopic;
 import elite.intel.companion.model.IntelActionCategory;
 import elite.intel.companion.model.Urgency;
-import elite.intel.companion.model.Verbosity;
 import elite.intel.companion.model.execution.ExecutionRequest;
 import elite.intel.companion.model.llm.*;
 import elite.intel.companion.model.memory.MemoryEntry;
@@ -18,8 +17,8 @@ import elite.intel.companion.model.memory.MemoryProcessingState;
 import elite.intel.companion.model.memory.MemorySource;
 import elite.intel.companion.model.speech.SpeechRequest;
 import elite.intel.companion.prompt.CompanionActionReducer;
-import elite.intel.companion.prompt.CompanionNarrationPolicy;
-import elite.intel.companion.prompt.CompanionNarrationPolicy.Narration;
+import elite.intel.companion.tools.IntelActionTypeResolver;
+import elite.intel.companion.tools.IntelActionTypeResolver.IntelActionType;
 import elite.intel.companion.prompt.IntelActionAccessPolicy;
 import elite.intel.companion.prompt.PromptComposer;
 import elite.intel.companion.speech.SpeechGateway;
@@ -63,10 +62,10 @@ class ThoughtTest {
                 reducer, state, dangerousPolicy, coordinator);
     }
 
-    private ThoughtContext ctx(CompanionNarrationPolicy narration) {
+    private ThoughtContext ctx(IntelActionTypeResolver resolver) {
         return new ThoughtContext(llm, speech, execution, memory,
                 new PromptComposer(), new IntelActionAccessPolicy(), new SystemFunctionProvider(),
-                reducer, state, dangerousPolicy, coordinator, narration);
+                reducer, state, dangerousPolicy, coordinator, resolver);
     }
 
     @Test
@@ -77,24 +76,27 @@ class ThoughtTest {
 
         assertEquals(1, llm.requests.size(), "nothing_to_do ends the turn; no extra LLM round");
         assertEquals(List.of(SpeakFunction.ID), execution.toolNames(), "only speak is executed; nothing_to_do is not");
-        // memory: commander input under the global topic, then the speak tool result.
+        // memory: commander input under the global topic, then the companion's own spoken words (not an ack).
         assertEquals(2, memory.writes.size());
         MemoryEntry input = memory.writes.get(0);
         assertEquals(MemorySource.COMMANDER, input.source());
         assertEquals(ConversationTopic.SOCIAL, input.topic());
         assertEquals(MemoryProcessingState.PROCESSED, input.processingState());
         assertEquals("set speed to 50", input.content());
-        assertEquals(MemorySource.TOOL_RESULT, memory.writes.get(1).source());
+        MemoryEntry spoken = memory.writes.get(1);
+        assertEquals(MemorySource.COMPANION, spoken.source(), "the companion's reply is recorded as COMPANION");
+        assertEquals("on it", spoken.content(), "the spoken words are recorded, not a {status:spoken} ack");
+        assertEquals(ConversationTopic.SOCIAL, spoken.topic());
     }
 
     /**
-     * Narration stub: close_panel is silent, ship_status is narratable, everything else neutral.
+     * Action-type stub: close_panel and ship_status are commands, everything else a system function.
+     * close_panel returns no spoken text (a side-effect command); ship_status returns an outcome.
      */
-    private static CompanionNarrationPolicy narration() {
-        return new CompanionNarrationPolicy(id -> switch (id) {
-            case "close_panel" -> Narration.SILENT_COMMAND;
-            case "ship_status" -> Narration.NARRATABLE;
-            default -> Narration.NEUTRAL;
+    private static IntelActionTypeResolver actionTypes() {
+        return new IntelActionTypeResolver(id -> switch (id) {
+            case "close_panel", "ship_status" -> IntelActionType.COMMAND;
+            default -> IntelActionType.SYSTEM;
         });
     }
 
@@ -104,26 +106,79 @@ class ThoughtTest {
                 call(SpeakFunction.ID, text("closing the panel")),
                 call(NothingToDoFunction.ID, new JsonObject())));
 
-        Thought.commander(Urgency.NORMAL, "close the panel", ctx(narration())).run();
+        Thought.commander(Urgency.NORMAL, "close the panel", ctx(actionTypes())).run();
 
         assertEquals(List.of("close_panel"), execution.toolNames(),
                 "silent command runs; the co-occurring speak is withheld (never executed)");
-        assertTrue(memory.writes.stream().anyMatch(e -> e.content().contains("narration_suppressed")),
-                "the withheld speak leaves a narration_suppressed tool result so the flow stays consistent");
+        assertTrue(memory.writes.stream().noneMatch(e -> e.content().contains("narration_suppressed")),
+                "the withheld speak said nothing, so it leaves no narration_suppressed noise in memory");
+        assertTrue(memory.writes.stream().noneMatch(e -> e.source() == MemorySource.COMPANION),
+                "nothing was spoken this turn, so there is no COMPANION entry");
     }
 
     @Test
-    void commanderMixedTurnStillSpeaks() {
-        // A silent command alongside a narratable query: the query answer is worth voicing, so speak runs.
-        llm.scripted.add(ok(call("close_panel", new JsonObject()),
-                call("ship_status", new JsonObject()),
-                call(SpeakFunction.ID, text("panel closed; hull at 100%")),
+    void commanderQueryOutcomeVocalizedDeterministicallyAndLlmSpeakDropped() {
+        // A query owns its spoken outcome: its text_to_speech_response is voiced verbatim through the speech
+        // gateway, and the LLM's own speak for the same turn is dropped (never re-voiced or rephrased).
+        execution.resultsByTool.put("ship_status", outcomeText("hull at 100 percent"));
+        llm.scripted.add(ok(call("ship_status", new JsonObject()),
+                call(SpeakFunction.ID, text("let me check the ship")),
                 call(NothingToDoFunction.ID, new JsonObject())));
 
-        Thought.commander(Urgency.NORMAL, "close the panel and how is the ship", ctx(narration())).run();
+        Thought.commander(Urgency.NORMAL, "how is the ship", ctx(actionTypes())).run();
 
-        assertTrue(execution.toolNames().contains(SpeakFunction.ID),
-                "a turn with any narratable action still speaks");
+        assertEquals(List.of("hull at 100 percent"), speech.requests.stream().map(SpeechRequest::text).toList(),
+                "the query's outcome text is vocalized deterministically");
+        assertFalse(execution.toolNames().contains(SpeakFunction.ID),
+                "the LLM's own speak is withheld once a command/query owns the spoken outcome");
+    }
+
+    @Test
+    void commanderCommandOutcomeIsVoicedAndRecordedSynchronously() {
+        // Fire-and-forget reverted: the command runs in-thread; its deterministic outcome is voiced and the
+        // real result is recorded (and fed back into the flow for the LLM to chain on).
+        execution.resultsByTool.put("ship_status", outcomeText("hull at 100 percent"));
+        llm.scripted.add(ok(call("ship_status", new JsonObject()), call(NothingToDoFunction.ID, new JsonObject())));
+
+        Thought.commander(Urgency.NORMAL, "how is the ship", ctx(actionTypes())).run();
+
+        assertEquals(List.of("hull at 100 percent"), speech.requests.stream().map(SpeechRequest::text).toList(),
+                "the deterministic outcome is voiced in-thread, not by a later callback");
+        assertTrue(memory.writes.stream().anyMatch(e -> e.source() == MemorySource.TOOL_RESULT
+                        && e.content().contains("hull at 100 percent")),
+                "the command result is recorded synchronously");
+    }
+
+    @Test
+    void commanderQueryAnswerIsVoicedAndRememberedAsCompanionLine() {
+        IntelActionTypeResolver asQuery = new IntelActionTypeResolver(
+                id -> "scan_system".equals(id) ? IntelActionType.QUERY : IntelActionType.SYSTEM);
+        execution.resultsByTool.put("scan_system", outcomeText("two stars and a gas giant"));
+        llm.scripted.add(ok(call("scan_system", new JsonObject()), call(NothingToDoFunction.ID, new JsonObject())));
+
+        Thought.commander(Urgency.NORMAL, "scan the system", ctx(asQuery)).run();
+
+        assertEquals(List.of("two stars and a gas giant"),
+                speech.requests.stream().map(SpeechRequest::text).toList(), "the query answer is voiced");
+        MemoryEntry answer = memory.writes.get(memory.writes.size() - 1);
+        assertEquals(MemorySource.COMPANION, answer.source(), "the answer is the companion's own remembered line");
+        assertEquals("two stars and a gas giant", answer.content());
+    }
+
+    @Test
+    void commanderMissionCriticalOutcomeVocalizedOnUrgentChannel() {
+        // A mission-critical command outcome (e.g. a plotted trade-stop instruction) is voiced on the
+        // urgent channel so it preempts current speech, exactly as the legacy MissionCritical channel did.
+        JsonObject critical = outcomeText("travel to Sol and buy gold");
+        critical.addProperty("mission_critical", true);
+        execution.resultsByTool.put("close_panel", critical); // a command stub (NARRATABLE) carrying a critical outcome
+        llm.scripted.add(ok(call("close_panel", new JsonObject()), call(NothingToDoFunction.ID, new JsonObject())));
+
+        Thought.commander(Urgency.NORMAL, "next trade stop", ctx(actionTypes())).run();
+
+        assertEquals(1, speech.requests.size());
+        assertEquals("travel to Sol and buy gold", speech.requests.get(0).text());
+        assertEquals(Urgency.URGENT, speech.requests.get(0).urgency(), "mission-critical outcome preempts");
     }
 
     @Test
@@ -133,7 +188,7 @@ class ThoughtTest {
         llm.scripted.add(ok(call("close_panel", new JsonObject())));
         llm.scripted.add(ok(call(SpeakFunction.ID, text("done")), call(NothingToDoFunction.ID, new JsonObject())));
 
-        Thought.commander(Urgency.NORMAL, "close the panel", ctx(narration())).run();
+        Thought.commander(Urgency.NORMAL, "close the panel", ctx(actionTypes())).run();
 
         assertEquals(List.of("close_panel"), execution.toolNames(),
                 "speak emitted in a later round of a silent-only turn is still withheld");
@@ -172,33 +227,64 @@ class ThoughtTest {
     }
 
     @Test
-    void eventThoughtIsQueryOnlyAndTaggedFromEventTopic() {
-        llm.scripted.add(ok(call(NothingToDoFunction.ID, new JsonObject())));
+    void highEventThoughtRecordsMemoryWithoutEngagingLlm() {
+        // HIGH importance: recorded to memory under its static topic and ends - no LLM, no speech, no tools
+        // (spontaneous event speech belongs to NarrationThought now).
+        Thought.event(Urgency.NORMAL, "jumped to Sol", ConversationTopic.NAVIGATION,
+                BaseEvent.Importance.HIGH, ctx()).run();
 
-        Thought.event(Urgency.NORMAL, "jumped to Sol", ConversationTopic.NAVIGATION, BaseEvent.Importance.HIGH, ctx()).run();
-
-        assertEquals(EnumSet.of(IntelActionCategory.QUERY), reducer.lastCategories,
-                "EVENT thought is offered only QUERY game tools");
+        assertTrue(llm.requests.isEmpty(), "EVENT thought must not engage the LLM");
+        assertTrue(speech.requests.isEmpty(), "EVENT thought never speaks");
+        assertEquals(1, memory.writes.size(), "the HIGH event is recorded once");
         MemoryEntry input = memory.writes.get(0);
         assertEquals(MemorySource.EVENT, input.source());
         assertEquals(ConversationTopic.NAVIGATION, input.topic(), "event memory tag comes from the event topic");
-        assertTrue(speech.requests.isEmpty());
+        assertEquals(MemoryProcessingState.PROCESSED, input.processingState());
+        assertEquals("jumped to Sol", input.content());
     }
 
     @Test
-    void normalEventThoughtRecordsMemoryWithoutEngagingLlm() {
-        // NORMAL importance: the thought records the event to memory and ends - no LLM round, no speech.
+    void normalEventThoughtIsDroppedAndNotRecorded() {
+        // NORMAL importance: dropped entirely - not recorded (would clutter the timeline), no LLM, no speech.
         Thought.event(Urgency.NORMAL, "docked at station", ConversationTopic.NAVIGATION,
                 BaseEvent.Importance.NORMAL, ctx()).run();
 
         assertTrue(llm.requests.isEmpty(), "NORMAL event must not engage the LLM");
         assertTrue(speech.requests.isEmpty(), "NORMAL event is never spoken");
-        assertEquals(1, memory.writes.size(), "NORMAL event is recorded once");
-        MemoryEntry input = memory.writes.get(0);
-        assertEquals(MemorySource.EVENT, input.source());
-        assertEquals(ConversationTopic.NAVIGATION, input.topic());
-        assertEquals(MemoryProcessingState.PROCESSED, input.processingState());
-        assertEquals("docked at station", input.content());
+        assertTrue(memory.writes.isEmpty(), "NORMAL event is not retained in memory");
+    }
+
+    @Test
+    void narrationThoughtSpeaksAndRecordsOnlyTheSpokenLine() {
+        // One short round: phrase the sensor data, voice it, remember only the spoken line (no raw data).
+        llm.scripted.add(ok(call(SpeakFunction.ID, text("Fuel is running low, Commander.")),
+                call(NothingToDoFunction.ID, new JsonObject())));
+
+        Thought.sensorNarration(Urgency.URGENT, "fuel reserve 12%", ConversationTopic.NAVIGATION, ctx()).run();
+
+        assertEquals(1, llm.requests.size(), "narration is a single short round");
+        assertEquals(List.of(SpeakFunction.ID), execution.toolNames(), "the phrased line is voiced via speak");
+        assertEquals(1, memory.writes.size(), "only the spoken line is recorded - the raw sensor data is not");
+        MemoryEntry spoken = memory.writes.get(0);
+        assertEquals(MemorySource.COMPANION, spoken.source());
+        assertEquals("Fuel is running low, Commander.", spoken.content());
+        assertEquals(ConversationTopic.NAVIGATION, spoken.topic());
+    }
+
+    @Test
+    void verbatimNarrationRecordsThenVoicesTheLineWithoutLlm() {
+        // A curated announcement already carries finished text: remember it, then voice it verbatim, no LLM.
+        Thought.verbatimNarration(Urgency.URGENT, "Target material detected, Commander.",
+                ConversationTopic.MINING, ctx()).run();
+
+        assertTrue(llm.requests.isEmpty(), "verbatim narration never engages the LLM");
+        assertEquals(1, memory.writes.size(), "the curated line is remembered as the companion's words");
+        MemoryEntry spoken = memory.writes.get(0);
+        assertEquals(MemorySource.COMPANION, spoken.source());
+        assertEquals(ConversationTopic.MINING, spoken.topic());
+        assertEquals("Target material detected, Commander.", spoken.content());
+        assertEquals(List.of("Target material detected, Commander."),
+                speech.requests.stream().map(SpeechRequest::text).toList(), "and voiced verbatim");
     }
 
     @Test
@@ -215,17 +301,6 @@ class ThoughtTest {
         assertNotNull(speech.requests.get(0).text());
         assertFalse(speech.requests.get(0).text().isBlank());
         assertTrue(execution.toolNames().isEmpty());
-    }
-
-    @Test
-    void eventInvalidResponseRecordsUnresolvedSilently() {
-        llm.scripted.add(invalid());
-
-        Thought.event(Urgency.NORMAL, "scanned by ship", ConversationTopic.COMBAT, BaseEvent.Importance.HIGH, ctx()).run();
-
-        assertEquals(ConversationTopic.UNRESOLVED_GAME_EVENT, memory.writes.get(0).topic());
-        assertEquals(MemoryProcessingState.UNRESOLVED, memory.writes.get(0).processingState());
-        assertTrue(speech.requests.isEmpty(), "event thought ends silently");
     }
 
     @Test
@@ -294,31 +369,7 @@ class ThoughtTest {
         assertEquals(MemoryProcessingState.INTERRUPTED, flushed.processingState());
     }
 
-    @Test
-    void quietEventThoughtIsNotOfferedSpeak() {
-        state.setVerbosity(Verbosity.QUIET);
-        llm.scripted.add(ok(call(NothingToDoFunction.ID, new JsonObject())));
-
-        Thought.event(Urgency.NORMAL, "jumped to Sol", ConversationTopic.NAVIGATION, BaseEvent.Importance.HIGH, ctx()).run();
-
-        assertFalse(offeredTool(SpeakFunction.ID), "QUIET non-urgent event must not be offered speak");
-    }
-
-    @Test
-    void chattyEventThoughtIsOfferedSpeak() {
-        state.setVerbosity(Verbosity.CHATTY);
-        llm.scripted.add(ok(call(NothingToDoFunction.ID, new JsonObject())));
-
-        Thought.event(Urgency.NORMAL, "jumped to Sol", ConversationTopic.NAVIGATION, BaseEvent.Importance.HIGH, ctx()).run();
-
-        assertTrue(offeredTool(SpeakFunction.ID), "CHATTY event may comment");
-    }
-
     // --- helpers ---
-
-    private boolean offeredTool(String name) {
-        return llm.requests.get(0).tools().stream().anyMatch(tool -> name.equals(tool.name()));
-    }
 
     private boolean hasState(MemoryProcessingState state) {
         return memory.writes.stream().anyMatch(e -> e.processingState() == state);
@@ -366,6 +417,15 @@ class ThoughtTest {
     private static JsonObject text(String value) {
         JsonObject o = new JsonObject();
         o.addProperty("text", value);
+        return o;
+    }
+
+    /**
+     * A command/query outcome carrying a spoken text_to_speech_response, as a handler's handle() returns.
+     */
+    private static JsonObject outcomeText(String value) {
+        JsonObject o = new JsonObject();
+        o.addProperty("text_to_speech_response", value);
         return o;
     }
 
