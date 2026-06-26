@@ -4,17 +4,9 @@ import com.google.gson.JsonObject;
 import elite.intel.ai.brain.commons.AiResponseLanguagePolicy;
 import elite.intel.ai.brain.i18n.LlmTextProvider;
 import elite.intel.companion.confirm.ConfirmationCoordinator;
-import elite.intel.companion.model.ConversationTopic;
-import elite.intel.companion.model.IntelActionCategory;
-import elite.intel.companion.model.ThoughtSource;
-import elite.intel.companion.model.Urgency;
+import elite.intel.companion.model.*;
 import elite.intel.companion.model.execution.ExecutionRequest;
-import elite.intel.companion.model.llm.LlmMessage;
-import elite.intel.companion.model.llm.LlmRequest;
-import elite.intel.companion.model.llm.LlmResult;
-import elite.intel.companion.model.llm.LlmToolDefinition;
-import elite.intel.companion.model.llm.LlmToolInvocation;
-import elite.intel.companion.model.llm.PromptCacheProfile;
+import elite.intel.companion.model.llm.*;
 import elite.intel.companion.model.memory.MemoryEntry;
 import elite.intel.companion.model.memory.MemoryProcessingState;
 import elite.intel.companion.model.memory.MemorySource;
@@ -24,6 +16,7 @@ import elite.intel.companion.prompt.EventSpeechPolicy;
 import elite.intel.companion.tools.ChangeGlobalTopicFunction;
 import elite.intel.companion.tools.NothingToDoFunction;
 import elite.intel.companion.tools.SpeakFunction;
+import elite.intel.gameapi.journal.events.BaseEvent;
 import elite.intel.i18n.Language;
 import elite.intel.session.SystemSession;
 import elite.intel.util.json.GsonFactory;
@@ -31,18 +24,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.IdentityHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * A unit of work of the consciousness. Owns its local message flow, request handles, the tool-calling
@@ -73,21 +56,34 @@ public final class Thought {
     private final ThoughtSource source;
     private final Urgency urgency;
     private final String currentInput;
+    private final EventInputKind eventInputKind;
     /** Memory tag for an EVENT thought (from the static event-type map); null for COMMANDER. */
     private final ConversationTopic eventTopic;
+    /** Importance of the originating event for an EVENT thought; null for COMMANDER. Drives the NORMAL short-circuit. */
+    private final BaseEvent.Importance importance;
     private final ThoughtContext ctx;
+
+    /**
+     * Turn-scoped narration accounting (COMMANDER only). Set as rounds execute: {@code turnRanNarratable}
+     * once any query or non-silent command runs, {@code turnRanSilentCommand} once any {@code silentInCompanion}
+     * command runs. A {@code speak} is dropped while a turn has run silent commands and nothing narratable.
+     */
+    private boolean turnRanNarratable;
+    private boolean turnRanSilentCommand;
 
     /** Set by {@link #interrupt} from another thread; the run loop honors it at step boundaries (§2.7). */
     private volatile boolean interrupted;
     /** The future the lane thread is currently awaiting (LLM round / confirmation wait), or null. */
     private volatile CompletableFuture<?> inFlight;
 
-    private Thought(ThoughtSource source, Urgency urgency, String currentInput,
-                    ConversationTopic eventTopic, ThoughtContext ctx) {
+    private Thought(ThoughtSource source, Urgency urgency, String currentInput, EventInputKind eventInputKind,
+                    ConversationTopic eventTopic, BaseEvent.Importance importance, ThoughtContext ctx) {
         this.source = source;
         this.urgency = urgency;
         this.currentInput = currentInput;
+        this.eventInputKind = eventInputKind;
         this.eventTopic = eventTopic;
+        this.importance = importance;
         this.ctx = ctx;
     }
 
@@ -96,15 +92,28 @@ public final class Thought {
      * (which a {@code change_global_topic} call may move during the thought).
      */
     public static Thought commander(Urgency urgency, String input, ThoughtContext ctx) {
-        return new Thought(ThoughtSource.COMMANDER, urgency, input, null, ctx);
+        return new Thought(ThoughtSource.COMMANDER, urgency, input, null, null, null, ctx);
     }
 
     /**
      * Creates a thought from a filtered game event. Its memory tag is fixed at birth from the static
-     * event-type map; an EVENT thought never moves the global conversation topic.
+     * event-type map; an EVENT thought never moves the global conversation topic. The event's importance
+     * drives behaviour in {@link #run}: a {@code NORMAL} event is recorded to memory without engaging the
+     * LLM, a {@code HIGH} one runs the full thinking loop ({@code LOW} never reaches here - the filter drops it).
      */
-    public static Thought event(Urgency urgency, String summary, ConversationTopic eventTopic, ThoughtContext ctx) {
-        return new Thought(ThoughtSource.EVENT, urgency, summary, eventTopic, ctx);
+    public static Thought event(Urgency urgency, String summary, ConversationTopic eventTopic,
+                                BaseEvent.Importance importance, ThoughtContext ctx) {
+        return new Thought(ThoughtSource.EVENT, urgency, summary, EventInputKind.GAME_EVENT, eventTopic, importance, ctx);
+    }
+
+    /**
+     * Creates an EVENT thought from subscriber-prepared sensor narration. The subscriber layer already
+     * decided this is worth saying, so this kind skips game query tools and bypasses verbosity suppression
+     * for {@code speak}; the LLM's job is to phrase the provided data/instructions.
+     */
+    public static Thought sensorNarration(Urgency urgency, String summary, ConversationTopic eventTopic, ThoughtContext ctx) {
+        return new Thought(ThoughtSource.EVENT, urgency, summary, EventInputKind.SENSOR_NARRATION,
+                eventTopic, BaseEvent.Importance.HIGH, ctx);
     }
 
     /**
@@ -113,6 +122,12 @@ public final class Thought {
      * returns an unrecoverable response (§2.5/§2.6/§2.8/§5.1). Blocking: it joins on each gateway future.
      */
     public void run() {
+        // NORMAL events are recorded to memory but never engage the LLM or speak (importance taxonomy,
+        // COMPANION_ARCHITECTURE.md §2.2): write the memory entry under the event's static topic and end.
+        if (source == ThoughtSource.EVENT && importance == BaseEvent.Importance.NORMAL) {
+            recordCurrentInput();
+            return;
+        }
         boolean inputRecorded = false;
         try {
             ComposedPrompt prompt = composeInitialPrompt();
@@ -189,8 +204,7 @@ public final class Thought {
 
     /** Assembles the seed prompt: access policy -> reduced game tools + system tools + memory snapshot. */
     private ComposedPrompt composeInitialPrompt() {
-        Set<IntelActionCategory> categories = ctx.intelActionAccessPolicy().allowedCategories(source);
-        List<LlmToolDefinition> selectedTools = ctx.reducer().selectTools(categories, currentInput);
+        List<LlmToolDefinition> selectedTools = selectedGameTools();
         return ctx.promptComposer().compose(
                 source, urgency, ctx.state().globalTopic(), currentInput,
                 selectedTools, systemTools(),
@@ -200,12 +214,26 @@ public final class Thought {
     }
 
     /**
+     * Game/query tool selection for the thought. Subscriber-prepared sensor narration does not receive
+     * query tools: the event subscriber already calculated and filtered the data to narrate.
+     */
+    private List<LlmToolDefinition> selectedGameTools() {
+        if (eventInputKind == EventInputKind.SENSOR_NARRATION) {
+            return List.of();
+        }
+        Set<IntelActionCategory> categories = ctx.intelActionAccessPolicy().allowedCategories(source);
+        return ctx.reducer().selectTools(categories, currentInput);
+    }
+
+    /**
      * System tools for this thought; an EVENT thought is denied {@code speak} when commentary is not
      * allowed by its urgency and the current verbosity (§2.11/§4.2), leaving it only {@code nothing_to_do}.
      */
     private List<LlmToolDefinition> systemTools() {
         List<LlmToolDefinition> tools = ctx.systemFunctionProvider().systemFunctions(source);
-        if (source == ThoughtSource.EVENT && !EventSpeechPolicy.mayComment(urgency, ctx.state().verbosity())) {
+        if (source == ThoughtSource.EVENT
+                && eventInputKind != EventInputKind.SENSOR_NARRATION
+                && !EventSpeechPolicy.mayComment(urgency, ctx.state().verbosity())) {
             return tools.stream().filter(tool -> !SpeakFunction.ID.equals(tool.name())).toList();
         }
         return tools;
@@ -238,6 +266,7 @@ public final class Thought {
      */
     private boolean runToolCalls(List<LlmMessage> flow, List<LlmToolInvocation> invocations,
                                  Map<LlmToolInvocation, JsonObject> preExecuted) {
+        boolean suppressSpeak = shouldSuppressSpeak(invocations);
         boolean terminate = false;
         List<LlmMessage> toolResults = new ArrayList<>();
         for (LlmToolInvocation inv : invocations) {
@@ -245,7 +274,12 @@ public final class Thought {
                 terminate = true;
                 continue;
             }
-            JsonObject result = preExecuted.containsKey(inv) ? preExecuted.get(inv) : execute(inv);
+            // A speak voiced only to acknowledge silent (cosmetic) commands is dropped: the command still
+            // ran, but no TTS fires. A synthetic result keeps the assistant/tool-result pairing intact so a
+            // following round stays valid, and tells the LLM the narration was intentionally withheld.
+            JsonObject result = suppressSpeak && SpeakFunction.ID.equals(inv.name())
+                    ? narrationSuppressedResult(inv.name())
+                    : (preExecuted.containsKey(inv) ? preExecuted.get(inv) : execute(inv));
             recordToolResult(result);
             toolResults.add(LlmMessage.toolResult(inv.id(), stringify(result)));
         }
@@ -254,6 +288,40 @@ public final class Thought {
             flow.addAll(toolResults);
         }
         return terminate;
+    }
+
+    /**
+     * Folds this round's game actions into the turn's narration accounting and decides whether the round's
+     * {@code speak} should be withheld. Only COMMANDER turns are gated (EVENT speech has its own policy via
+     * {@link #systemTools()}); a speak is dropped when the turn has run at least one silent command and
+     * nothing narratable (a query or non-silent command), so a turn whose sole effect was a cosmetic UI
+     * command stays quiet while a mixed turn still speaks.
+     */
+    private boolean shouldSuppressSpeak(List<LlmToolInvocation> invocations) {
+        if (source != ThoughtSource.COMMANDER) {
+            return false;
+        }
+        for (LlmToolInvocation inv : invocations) {
+            if (SpeakFunction.ID.equals(inv.name()) || NothingToDoFunction.ID.equals(inv.name())) {
+                continue;
+            }
+            switch (ctx.narrationPolicy().classify(inv.name())) {
+                case NARRATABLE -> turnRanNarratable = true;
+                case SILENT_COMMAND -> turnRanSilentCommand = true;
+                case NEUTRAL -> { /* no opinion: neither forces nor suppresses speech */ }
+            }
+        }
+        return turnRanSilentCommand && !turnRanNarratable;
+    }
+
+    /**
+     * Synthetic tool result standing in for a withheld {@code speak} on a silent-command turn.
+     */
+    private static JsonObject narrationSuppressedResult(String toolName) {
+        JsonObject suppressed = new JsonObject();
+        suppressed.addProperty("status", "narration_suppressed");
+        suppressed.addProperty("tool", toolName);
+        return suppressed;
     }
 
     /** Runs one tool-call via the execution gateway; a failed call becomes an error result the LLM can read. */

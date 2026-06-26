@@ -15,6 +15,16 @@ public interface IntelCommand extends IntelAction {
         return false;
     }
 
+    /**
+     * Indicates whether the command should operate silently within a companion context.
+     *
+     * @return {@code true} if the command operates silently when executed in a companion context,
+     * otherwise {@code false}. Default is silent.
+     */
+    default boolean silentInCompanion() {
+        return true;
+    }
+
     default VoiceStrategy voiceStrategy() {
         return VoiceStrategy.CANNED;
     }
@@ -35,11 +45,16 @@ public interface IntelCommand extends IntelAction {
         return CommandKind.ACTION;
     }
 
-    void execute(JsonObject params, String responseText);
+    /**
+     * Executes the command and returns its outcome (see {@link elite.intel.ai.brain.actions.CommandOutcome}),
+     * or {@code null} for a silent side-effect. The active conversational owner of the current mode renders
+     * the outcome: the legacy {@code ResponseRouter} speaks it, the companion hands it back as a tool result.
+     * Commands no longer narrate themselves by publishing voice events.
+     */
+    JsonObject execute(JsonObject params, String responseText);
 
     @Override
     default JsonObject handle(String action, JsonObject params, String responseText) {
-        execute(params, responseText);
-        return null;
+        return execute(params, responseText);
     }
 }

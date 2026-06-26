@@ -1,6 +1,7 @@
 package elite.intel.companion.mind;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import elite.intel.companion.confirm.ConfirmationCoordinator;
 import elite.intel.companion.execution.ExecutionGateway;
 import elite.intel.companion.llm.LlmGateway;
@@ -8,6 +9,7 @@ import elite.intel.companion.memory.MemoryAvailabilitySnapshot;
 import elite.intel.companion.memory.MemoryGateway;
 import elite.intel.companion.model.ConversationTopic;
 import elite.intel.companion.model.Urgency;
+import elite.intel.companion.model.Verbosity;
 import elite.intel.companion.model.execution.ExecutionRequest;
 import elite.intel.companion.model.llm.LlmRequest;
 import elite.intel.companion.model.llm.LlmResult;
@@ -20,13 +22,16 @@ import elite.intel.companion.prompt.IntelActionAccessPolicy;
 import elite.intel.companion.prompt.PromptComposer;
 import elite.intel.companion.speech.SpeechGateway;
 import elite.intel.companion.tools.NothingToDoFunction;
+import elite.intel.companion.tools.SpeakFunction;
 import elite.intel.companion.tools.SystemFunctionProvider;
+import elite.intel.gameapi.SensorDataEvent;
 import elite.intel.gameapi.journal.events.BaseEvent;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -81,6 +86,83 @@ class ThoughtDispatcherTest {
         MemoryEntry entry = memory.writes.get(0);
         assertEquals(MemorySource.EVENT, entry.source());
         assertEquals(ConversationTopic.NAVIGATION, entry.topic(), "event memory tag comes from the event-type map");
+    }
+
+    @Test
+    void eventCurrentInputUsesLlmDescriptionInPromptAndMemory() {
+        CapturingLlm llm = new CapturingLlm();
+        ThoughtDispatcher dispatcher = new ThoughtDispatcher(ctxWith(llm));
+        dispatcher.start();
+        dispatcher.submitEvent(new FakeEvent("FSDJump", BaseEvent.Importance.HIGH,
+                "The ship completed a hyperspace jump.", "arrived in Sol"));
+        dispatcher.stop();
+
+        assertEquals(1, llm.requests.size());
+        assertEquals(1, memory.writes.size());
+
+        String memoryContent = memory.writes.get(0).content();
+        String promptContent = llm.requests.get(0).messages().get(2).content();
+        assertTrue(promptContent.contains(memoryContent),
+                "prompt and memory must use the same formatted event currentInput");
+
+        JsonObject input = JsonParser.parseString(memoryContent).getAsJsonObject();
+        assertEquals("FSDJump", input.get("event_type").getAsString());
+        assertEquals("The ship completed a hyperspace jump.", input.get("description").getAsString());
+        assertEquals("arrived in Sol", input.getAsJsonObject("payload").get("detail").getAsString());
+    }
+
+    @Test
+    void normalEventIsRecordedWithoutEngagingLlm() {
+        // A NORMAL event short-circuits inside the thought: memory is written, the LLM is never called.
+        LlmGateway failIfCalled = new LlmGateway() {
+            @Override public CompletableFuture<LlmResult> submit(LlmRequest request) {
+                throw new AssertionError("NORMAL event must not engage the LLM");
+            }
+            @Override public CompletableFuture<String> compressMidTermMemory(LlmRequest request) {
+                return CompletableFuture.completedFuture(null);
+            }
+        };
+        ThoughtDispatcher dispatcher = new ThoughtDispatcher(ctxWith(failIfCalled));
+        dispatcher.start();
+        dispatcher.submitEvent(new FakeEvent("MarketSell", BaseEvent.Importance.NORMAL));
+        dispatcher.stop();
+
+        assertEquals(1, memory.writes.size());
+        assertEquals(MemorySource.EVENT, memory.writes.get(0).source());
+        assertEquals(MemoryProcessingState.PROCESSED, memory.writes.get(0).processingState());
+    }
+
+    @Test
+    void sensorNarrationUsesProvidedTopicAndNarrationOnlyToolsEvenWhenQuiet() {
+        CapturingLlm llm = new CapturingLlm();
+        CompanionState state = new CompanionState();
+        state.setVerbosity(Verbosity.QUIET);
+        ThoughtContext ctx = new ThoughtContext(
+                llm, new FakeSpeech(), new FakeExecution(), memory,
+                new PromptComposer(), new IntelActionAccessPolicy(), new SystemFunctionProvider(),
+                (categories, currentInput) -> { throw new AssertionError("sensor narration must not select query tools"); },
+                state, invocation -> false, new ConfirmationCoordinator());
+        ThoughtDispatcher dispatcher = new ThoughtDispatcher(ctx);
+        dispatcher.start();
+
+        dispatcher.submitSensorData(new SensorDataEvent(
+                "In route to Sol, G class star.",
+                "Announce this route information.",
+                SensorDataEvent.TOPIC_NAVIGATION));
+        dispatcher.stop();
+
+        assertEquals(1, llm.requests.size());
+        assertEquals(Set.of(SpeakFunction.ID, NothingToDoFunction.ID),
+                llm.requests.get(0).tools().stream().map(tool -> tool.name()).collect(java.util.stream.Collectors.toSet()));
+
+        assertEquals(1, memory.writes.size());
+        MemoryEntry entry = memory.writes.get(0);
+        assertEquals(ConversationTopic.NAVIGATION, entry.topic());
+        JsonObject input = JsonParser.parseString(entry.content()).getAsJsonObject();
+        assertEquals("SensorData", input.get("event_type").getAsString());
+        assertEquals("navigation", input.get("topic").getAsString());
+        assertEquals("Announce this route information.", input.get("instructions").getAsString());
+        assertEquals("sensorData: In route to Sol, G class star.", input.get("payload").getAsString());
     }
 
     @Test
@@ -244,6 +326,21 @@ class ThoughtDispatcherTest {
         }
     }
 
+    private static final class CapturingLlm implements LlmGateway {
+        final List<LlmRequest> requests = new CopyOnWriteArrayList<>();
+
+        @Override public CompletableFuture<LlmResult> submit(LlmRequest request) {
+            requests.add(request);
+            LlmToolInvocation terminator = new LlmToolInvocation(UUID.randomUUID().toString(),
+                    NothingToDoFunction.ID, new JsonObject());
+            return CompletableFuture.completedFuture(new LlmResult(LlmResult.Status.OK, List.of(terminator)));
+        }
+
+        @Override public CompletableFuture<String> compressMidTermMemory(LlmRequest request) {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
     private static final class FakeMemory implements MemoryGateway {
         final List<MemoryEntry> writes = new CopyOnWriteArrayList<>();
 
@@ -275,13 +372,35 @@ class ThoughtDispatcherTest {
 
     private static final class FakeEvent extends BaseEvent {
         private final String type;
+        private final Importance importance;
+        private final String description;
+        private final String detail;
 
         FakeEvent(String type) {
+            this(type, Importance.HIGH); // default: exercise the full thinking loop
+        }
+
+        FakeEvent(String type, Importance importance) {
+            this(type, importance, "Description for " + type, "detail for " + type);
+        }
+
+        FakeEvent(String type, Importance importance, String description, String detail) {
             super(Instant.now().toString(), Duration.ofMinutes(1), type);
             this.type = type;
+            this.importance = importance;
+            this.description = description;
+            this.detail = detail;
         }
 
         @Override public String getEventType() { return type; }
-        @Override public JsonObject toJsonObject() { return new JsonObject(); }
+        @Override public Importance importance() { return importance; }
+        @Override public String llmDescription() { return description; }
+        @Override public String toJson() { return toJsonObject().toString(); }
+        @Override public JsonObject toJsonObject() {
+            JsonObject object = new JsonObject();
+            object.addProperty("event", type);
+            object.addProperty("detail", detail);
+            return object;
+        }
     }
 }

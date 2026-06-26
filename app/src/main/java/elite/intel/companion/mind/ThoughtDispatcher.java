@@ -1,12 +1,17 @@
 package elite.intel.companion.mind;
 
+import elite.intel.companion.input.EventInputFormatter;
 import elite.intel.companion.input.EventTopicMap;
+import elite.intel.companion.input.SensorInputFormatter;
+import elite.intel.companion.model.ConversationTopic;
 import elite.intel.companion.model.Urgency;
+import elite.intel.gameapi.SensorDataEvent;
 import elite.intel.gameapi.journal.events.BaseEvent;
 import elite.intel.ui.controller.ManagedService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -71,13 +76,35 @@ public final class ThoughtDispatcher implements ManagedService {
         enqueue(commanderLane, Thought.commander(urgency, input, ctx), urgency);
     }
 
-    /** Accepts a filtered game event, creates an EVENT thought, and queues it on the event lane. */
+    /**
+     * Accepts a filtered game event, creates an EVENT thought, and queues it on the event lane. The event's
+     * {@link BaseEvent#importance()} is forwarded to the thought (a forwarded property, not an interpretation
+     * of meaning): a {@code NORMAL} event is recorded to memory without engaging the LLM, a {@code HIGH} one
+     * runs the full thinking loop (see {@code Thought#run} and COMPANION_ARCHITECTURE.md §2.2).
+     */
     public void submitEvent(BaseEvent event) {
         if (event == null) {
             return;
         }
         Urgency urgency = urgencyPolicy.forEvent(event);
-        enqueue(eventLane, Thought.event(urgency, summarize(event), EventTopicMap.topicFor(event), ctx), urgency);
+        enqueue(eventLane,
+                Thought.event(urgency, summarize(event), EventTopicMap.topicFor(event), event.importance(), ctx),
+                urgency);
+    }
+
+    /**
+     * Accepts subscriber-prepared sensor narration, creates an EVENT thought, and queues it on the event lane.
+     * SensorDataEvent is trusted output from gameplay subscribers: they already applied settings, filtering,
+     * and calculations, so the thought is born as urgent narration under the topic provided by that layer.
+     */
+    public void submitSensorData(SensorDataEvent event) {
+        if (event == null) {
+            return;
+        }
+        Urgency urgency = Urgency.URGENT;
+        enqueue(eventLane,
+                Thought.sensorNarration(urgency, SensorInputFormatter.format(event), sensorTopic(event), ctx),
+                urgency);
     }
 
     @Override
@@ -172,8 +199,16 @@ public final class ThoughtDispatcher implements ManagedService {
         }
     }
 
-    /** The current input text for an EVENT thought is the event's own JSON (non-mutating, unlike toYaml). */
+    /** The current input text for an EVENT thought is the shared prompt/memory event envelope. */
     private static String summarize(BaseEvent event) {
-        return event.toJson();
+        return EventInputFormatter.format(event);
+    }
+
+    private static ConversationTopic sensorTopic(SensorDataEvent event) {
+        try {
+            return ConversationTopic.valueOf(event.getTopic().trim().toUpperCase(Locale.ROOT));
+        } catch (RuntimeException invalidTopic) {
+            return ConversationTopic.SYSTEM;
+        }
     }
 }
